@@ -1,0 +1,28 @@
+{
+  "name": "wordpress-to-astro",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "npm run build && node dist/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Robeen3242/Wordpress-to-Astro.git"
+  },
+  "keywords": [],
+  "bugs": {
+    "url": "https://github.com/Robeen3242/Wordpress-to-Astro/issues"
+  },
+  "homepage": "https://github.com/Robeen3242/Wordpress-to-Astro#readme",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "playwright": "^1.65.0"
+  }
+}
