@@ -5,3 +5,5 @@ dist/
 .astro/
 output/
 screenshots/
+journal/
+generated/
