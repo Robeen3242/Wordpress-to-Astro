@@ -25,6 +25,7 @@ type IRNode = {
   tag: string;
   attributes: Record<string, string>;
   text: string;
+  content?: Array<{ type: "text"; value: string } | { type: "element"; id: number }>;
   desktop: Snapshot;
   mobile?: Snapshot;
   children: IRNode[];
@@ -106,9 +107,8 @@ function renderNode(node: IRNode, level: number, base: string,
   const tag = node.tag.toLowerCase();
   if (OMIT_TAGS.has(tag) || !/^[a-z][a-z0-9-]*$/.test(tag)) return "";
   if (tag === "input" && node.attributes.type?.toLowerCase() === "hidden") return "";
-  // The existing WordPress newsletter has no submission backend in the POC.
-  // Keep its layout hooks but never generate an operational form.
-  const resultTag = tag === "form" ? "div" : tag;
+  // Keep form semantics and CSS selector compatibility; submissions are blocked.
+  const resultTag = tag;
   const attributes: string[] = [`data-ir-id="${node.id}"`];
   const transactional = tag === "a" && (isTransactionalLink(node.attributes.href ?? "", node.text) || /\b(?:online shop|shop online)\b/i.test(node.text)) &&
     !rewriteInternalHref(node.attributes.href ?? "", base, routes);
@@ -146,7 +146,7 @@ function renderNode(node: IRNode, level: number, base: string,
       attributes.push(`${keyRaw}="${attrValue(original)}"`);
     }
   }
-  if (tag === "form") attributes.push('data-static-newsletter="true"');
+  if (tag === "form") attributes.push('data-static-newsletter="true"', 'data-static-form="true"');
   if (transactional || unmigratedInternal) attributes.push('aria-disabled="true"', 'data-static-action="true"');
   if (unmigratedInternal && !transactional) warnings.push(`Unmigrated internal link on ${base}: ${node.attributes.href}`);
   if (submit) attributes.push('type="button"', 'aria-disabled="true"', 'data-static-submit="true"');
@@ -157,6 +157,15 @@ function renderNode(node: IRNode, level: number, base: string,
   const pad = "  ".repeat(level);
   const open = `${pad}<${resultTag}${attributes.length ? " " + attributes.join(" ") : ""}`;
   if (VOID_ELEMENTS.has(resultTag)) return `${open} />`;
+  if (node.content) {
+    const children = new Map(node.children.map(child => [child.id, child]));
+    // Compact rendering avoids inserting formatting whitespace between inline nodes.
+    const ordered = node.content.map(item => item.type === "text"
+      ? escapeAstroText(item.value)
+      : (children.has(item.id) ? renderNode(children.get(item.id)!, 0, base, assetMap, warnings, routes) : ""));
+    return `${open}>${ordered.join("")}</${resultTag}>`;
+  }
+  // Older capture/IR format: retain its previous rendering behavior.
   const body: string[] = [];
   if (node.text) body.push(`${"  ".repeat(level + 1)}${escapeAstroText(node.text)}`);
   for (const child of node.children) {
@@ -187,7 +196,16 @@ function pageTemplate(ir: PageIR, sections: string, hasHeader: boolean, hasFoote
   const description = ir.metadata.description
     ? `\n    <meta name="description" content="${attrValue(ir.metadata.description)}" />` : "";
   const bodyClass = attrValue(ir.theme?.bodyClass || "");
-  return `---\n${imports.join("\n")}\n---\n<!doctype html>\n<html lang="${attrValue(ir.metadata.language || "en")}">\n  <head>\n    <meta charset="utf-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1" />\n    <title>${title}</title>${description}\n${stylesheets.map((href) => `    <link rel="stylesheet" href="${attrValue(href)}" />`).join("\n")}${hasThemeCss ? '\n    <link rel="stylesheet" href="' + themePath + '" />' : ""}\n  </head>\n  <body${bodyClass ? ` class="${bodyClass}"` : ""}>\n${hasHeader ? "    <Header />\n" : ""}    <main id="generated-main">\n${sections}\n    </main>\n${hasFooter ? "    <Footer />\n" : ""}${hasMobileNavigation ? '\n    <script>\n      const nav = document.getElementById("mobile-nav");\n      const overlay = document.querySelector<HTMLElement>(".mobile-nav-overlay");\n      const toggle = document.querySelector<HTMLButtonElement>(".mobile-menu-button");\n      const close = nav?.querySelector<HTMLButtonElement>(".mobile-menu-close");\n      function setMenu(open: boolean) {\n        nav?.classList.toggle("is-open", open);\n        overlay?.classList.toggle("is-open", open);\n        toggle?.setAttribute("aria-expanded", String(open));\n      }\n      toggle?.setAttribute("aria-expanded", "false");\n      toggle?.addEventListener("click", () => setMenu(true));\n      close?.addEventListener("click", () => setMenu(false));\n      overlay?.addEventListener("click", () => setMenu(false));\n      document.addEventListener("keydown", (event) => { if (event.key === "Escape") setMenu(false); });\n    </script>\n' : ""}  </body>\n</html>\n`;
+  return `---\n${imports.join("\n")}\n---\n<!doctype html>\n<html lang="${attrValue(ir.metadata.language || "en")}">\n  <head>\n    <meta charset="utf-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1" />\n    <title>${title}</title>${description}\n${stylesheets.map((href) => `    <link rel="stylesheet" href="${attrValue(href)}" />`).join("\n")}${hasThemeCss ? '\n    <link rel="stylesheet" href="' + themePath + '" />' : ""}\n  </head>\n  <body${bodyClass ? ` class="${bodyClass}"` : ""}>\n${hasHeader ? "    <Header />\n" : ""}    <main id="generated-main">\n${sections}\n    </main>\n${hasFooter ? "    <Footer />\n" : ""}${hasMobileNavigation ? '\n    <script>\n      const nav = document.getElementById("mobile-nav");\n      const overlay = document.querySelector<HTMLElement>(".mobile-nav-overlay");\n      const toggle = document.querySelector<HTMLButtonElement>(".mobile-menu-button");\n      const close = nav?.querySelector<HTMLButtonElement>(".mobile-menu-close");\n      function setMenu(open: boolean) {\n        nav?.classList.toggle("is-open", open);\n        overlay?.classList.toggle("is-open", open);\n        toggle?.setAttribute("aria-expanded", String(open));\n      }\n      toggle?.setAttribute("aria-expanded", "false");\n      toggle?.addEventListener("click", () => setMenu(true));\n      close?.addEventListener("click", () => setMenu(false));\n      overlay?.addEventListener("click", () => setMenu(false));\n      document.addEventListener("keydown", (event) => { if (event.key === "Escape") setMenu(false); });\n    </script>\n' : ""}    <script>
+      // Forms are visual replicas only. Prevent Enter-key and scripted submit events.
+      document.addEventListener("submit", (event) => {
+        if (event.target instanceof HTMLFormElement && event.target.matches('[data-static-form="true"]')) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      }, true);
+    </script>
+  </body>\n</html>\n`;
 }
 
 function generatedCss(hasMobileNavigation: boolean): string {

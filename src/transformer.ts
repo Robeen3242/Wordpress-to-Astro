@@ -16,6 +16,7 @@ type RawElement = {
   tag: string;
   attributes: Record<string, string>;
   text: string;
+  childNodes?: Array<{ type: "text"; value: string } | { type: "element"; id: number }>;
   rectangle: Box;
   computedStyles: Record<string, string>;
   pseudoElements?: { before?: { content: string }; after?: { content: string } };
@@ -43,7 +44,8 @@ export type IRNode = {
   id: number;
   tag: string;
   attributes: Record<string, string>;
-  text: string; // Direct text only; concatenate descendants when displaying a subtree.
+  text: string; // Legacy direct text; used for older captures.
+  content?: Array<{ type: "text"; value: string } | { type: "element"; id: number }>;
   desktop: VisualSnapshot;
   mobile?: VisualSnapshot;
   children: IRNode[];
@@ -255,6 +257,7 @@ export function transformCaptures(desktop: Capture, mobile?: Capture, report?: E
       tag: raw.tag,
       attributes: raw.attributes,
       text: raw.text,
+      ...(raw.childNodes ? { content: raw.childNodes } : {}),
       desktop: visual(raw),
       ...(alignedMobile ? { mobile: visual(alignedMobile.elements[raw.id]) } : {}),
       children: [],
@@ -263,6 +266,10 @@ export function transformCaptures(desktop: Capture, mobile?: Capture, report?: E
     for (const child of children.get(raw.id) || []) {
       const nested = makeNode(child);
       if (nested) node.children.push(nested);
+    }
+    if (node.content) {
+      const included = new Set(node.children.map(child => child.id));
+      node.content = node.content.filter(item => item.type === "text" || included.has(item.id));
     }
     return node;
   };

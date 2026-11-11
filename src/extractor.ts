@@ -176,6 +176,21 @@ async function extractPageData(page: Page) {
         .join(" ")
         .trim();
 
+      // Preserve the original interleaving of text and child elements. Text is
+      // deliberately not trimmed: whitespace between inline nodes is meaningful.
+      const childNodes: Array<{ type: "text"; value: string } | { type: "element"; id: number }> = [];
+      for (const child of Array.from(element.childNodes)) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          childNodes.push({ type: "text", value: child.textContent ?? "" });
+          continue;
+        }
+        if (child.nodeType === Node.ELEMENT_NODE) {
+          const childIndex = elements.indexOf(child as Element);
+          if (childIndex >= 0) childNodes.push({ type: "element", id: childIndex });
+          continue;
+        }
+      }
+
       const parentIndex = element.parentElement
         ? elements.indexOf(element.parentElement)
         : -1;
@@ -186,6 +201,7 @@ async function extractPageData(page: Page) {
         tag: element.tagName.toLowerCase(),
         attributes,
         text: directText,
+        childNodes,
         rectangle: {
           x: rect.x,
           y: rect.y + window.scrollY,

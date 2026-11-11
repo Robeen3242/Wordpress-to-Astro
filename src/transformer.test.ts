@@ -69,3 +69,23 @@ test("preserves body theme class and extracted inline theme CSS", async () => {
   assert.equal(ir.theme.bodyClass, "home cellar-theme");
   assert.match(ir.theme.css, /--tertiary: #dca442/);
 });
+
+test("preserves ordered text and element references in the IR", async () => {
+  const { transformCaptures } = await import("./transformer.js");
+  const snap = { x: 0, y: 0, width: 300, height: 40 };
+  const raw = (id: number, parentIndex: number, tag: string, text: string, childNodes?: Array<{ type: "text"; value: string } | { type: "element"; id: number }>) =>
+    ({ id, parentIndex, tag, text, attributes: {}, rectangle: snap, computedStyles: { display: "block", visibility: "visible", opacity: "1" }, ...(childNodes ? { childNodes } : {}) });
+  const capture = {
+    url: "https://example.com/contact/", title: "Contact", description: "", language: "en",
+    viewport: { width: 1440, height: 900, documentWidth: 1440, documentHeight: 900 },
+    totalElementCount: 4, extractedElementCount: 4,
+    elements: [raw(0, -1, "html", ""), raw(1, 0, "body", ""),
+      raw(2, 1, "p", "123", [{ type: "element", id: 3 }, { type: "text", value: " 123" }]),
+      raw(3, 2, "strong", "Phone:", [{ type: "text", value: "Phone:" }])],
+    images: [], headings: [], links: [], fonts: [], inlineStyles: []
+  };
+  const ir = transformCaptures(capture);
+  const paragraph = ir.sections[0].root;
+  assert.deepEqual(paragraph.content, [{ type: "element", id: 3 }, { type: "text", value: " 123" }]);
+  assert.equal(paragraph.children[0].content?.[0]?.type, "text");
+});
