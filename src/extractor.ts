@@ -100,6 +100,7 @@ async function loadLazyContent(page: Page) {
 }
 
 async function extractPageData(page: Page) {
+  //captures style rather than css declarations to support cascading rules
   return page.evaluate((maxElements) => {
     const cssProperties = [
       "display",
@@ -145,7 +146,8 @@ async function extractPageData(page: Page) {
       "align-items",
       "grid-template-columns",
     ];
-
+    // Max is 15000 elements but there is no algorithm to determine whats important
+    // so its first come first serve
     const elements = Array.from(
       document.querySelectorAll("*")
     ).slice(0, maxElements);
@@ -285,7 +287,8 @@ async function extractPageData(page: Page) {
 }
 
 export async function extractWebsite(
-  sourceUrl: string
+  sourceUrl: string,
+  specifiedOutputDirectory?: string
 ): Promise<ExtractionResult> {
   const source = new URL(sourceUrl);
 
@@ -300,7 +303,7 @@ export async function extractWebsite(
   const folderName =
     `${safeName(source.hostname)}-${timestamp}`;
 
-  const outputDirectory = path.resolve(
+  const outputDirectory = specifiedOutputDirectory ?? path.resolve(
     "output",
     folderName
   );
@@ -452,7 +455,7 @@ export async function extractWebsite(
 
         await loadLazyContent(page);
 
-        // Wait for network resource saves to finish.
+        // ISSUE: Waits for promises upon invoking, there may be additional invocations
         await Promise.all(pendingDownloads);
 
         const data = await extractPageData(page);

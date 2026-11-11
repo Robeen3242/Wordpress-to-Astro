@@ -12,6 +12,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
+import { canonicalPageUrl, rewriteInternalHref, isTransactionalLink } from "./routes.js";
 
 type Snapshot = {
   box: { x: number; y: number; width: number; height: number };
@@ -100,7 +102,7 @@ function safeLink(value: string): boolean {
 }
 
 function renderNode(node: IRNode, level: number, base: string,
-                    assetMap: Map<string, string>, warnings: string[]): string {
+                    assetMap: Map<string, string>, warnings: string[], routes: ReadonlyMap<string, string> = new Map()): string {
   const tag = node.tag.toLowerCase();
   if (OMIT_TAGS.has(tag) || !/^[a-z][a-z0-9-]*$/.test(tag)) return "";
   if (tag === "input" && node.attributes.type?.toLowerCase() === "hidden") return "";
@@ -108,15 +110,29 @@ function renderNode(node: IRNode, level: number, base: string,
   // Keep its layout hooks but never generate an operational form.
   const resultTag = tag === "form" ? "div" : tag;
   const attributes: string[] = [`data-ir-id="${node.id}"`];
+  const transactional = tag === "a" && (isTransactionalLink(node.attributes.href ?? "", node.text) || /\b(?:online shop|shop online)\b/i.test(node.text)) &&
+    !rewriteInternalHref(node.attributes.href ?? "", base, routes);
+  const unmigratedInternal = tag === "a" && Boolean(node.attributes.href) &&
+    (() => { try {
+      const target = new URL(node.attributes.href, base);
+      return target.origin === new URL(base).origin && !rewriteInternalHref(node.attributes.href, base, routes) &&
+        !node.attributes.href.startsWith('#') && !['mailto:', 'tel:'].includes(target.protocol);
+    } catch { return false; } })() && routes.size > 0;
+  const submit = tag === "button" && (node.attributes.type === "submit" ||
+    /(?:submit|buy|purchase|checkout|cart|order)/i.test(`${node.attributes.id ?? ""} ${node.attributes.class ?? ""} ${node.text}`));
   for (const [keyRaw, original] of Object.entries(node.attributes)) {
     const key = keyRaw.toLowerCase();
     if (!SAFE_ATTR.test(keyRaw) || IGNORE_ATTR.has(key) || key.startsWith("on") ||
         key === "data-ir-id" || key === "srcset" && tag !== "img" ||
         (tag === "form" && ["action", "method", "enctype", "target"].includes(key))) continue;
     if (tag === "input" && (key === "name" || key === "value" && node.attributes.type === "hidden")) continue;
-    if (key === "href" && !safeLink(original)) continue;
+    if (key === "href" && (!safeLink(original) || transactional || unmigratedInternal)) continue;
+    if (tag === "button" && submit && (key === "type" || key === "formaction" || key === "formmethod")) continue;
+    if (key === "formaction" || key === "formmethod") continue;
     if (key === "src" && !safeLink(original)) continue;
-    if (key === "style") {
+    if (key === "href") {
+      attributes.push(`href="${attrValue(rewriteInternalHref(original, base, routes) ?? original)}"`);
+    } else if (key === "style") {
       attributes.push(`style="${attrValue(rewriteStyle(original, base, assetMap))}"`);
     } else if (key === "src" || key === "poster") {
       attributes.push(`${key}="${attrValue(mapAsset(original, base, assetMap))}"`);
@@ -131,8 +147,11 @@ function renderNode(node: IRNode, level: number, base: string,
     }
   }
   if (tag === "form") attributes.push('data-static-newsletter="true"');
+  if (transactional || unmigratedInternal) attributes.push('aria-disabled="true"', 'data-static-action="true"');
+  if (unmigratedInternal && !transactional) warnings.push(`Unmigrated internal link on ${base}: ${node.attributes.href}`);
+  if (submit) attributes.push('type="button"', 'aria-disabled="true"', 'data-static-submit="true"');
   if (tag === "button" && node.attributes.id?.startsWith("gform_submit_")) {
-    attributes.push('type="button"', 'aria-disabled="true"', 'data-static-submit="true"');
+    if (!submit) attributes.push('type="button"', 'aria-disabled="true"', 'data-static-submit="true"');
     warnings.push("Newsletter submit button is visual-only; no backend is connected.");
   }
   const pad = "  ".repeat(level);
@@ -141,7 +160,7 @@ function renderNode(node: IRNode, level: number, base: string,
   const body: string[] = [];
   if (node.text) body.push(`${"  ".repeat(level + 1)}${escapeAstroText(node.text)}`);
   for (const child of node.children) {
-    const rendered = renderNode(child, level + 1, base, assetMap, warnings);
+    const rendered = renderNode(child, level + 1, base, assetMap, warnings, routes);
     if (rendered) body.push(rendered);
   }
   return body.length ? `${open}>\n${body.join("\n")}\n${pad}</${resultTag}>` : `${open}></${resultTag}>`;
@@ -156,17 +175,19 @@ function shouldSkipSection(section: IRSection): boolean {
 }
 
 function pageTemplate(ir: PageIR, sections: string, hasHeader: boolean, hasFooter: boolean,
-                      stylesheets: string[], hasMobileNavigation: boolean, hasThemeCss: boolean): string {
+                      stylesheets: string[], hasMobileNavigation: boolean, hasThemeCss: boolean,
+                       componentImports = "../components", styleImport = "../styles/generated.css",
+                       headerName = "Header", footerName = "Footer", themePath = "/source-theme.css"): string {
   const imports = [
-    ...(hasHeader ? ['import Header from "../components/Header.astro";'] : []),
-    ...(hasFooter ? ['import Footer from "../components/Footer.astro";'] : []),
-    'import "../styles/generated.css";',
+    ...(hasHeader ? [`import Header from "${componentImports}/${headerName}.astro";`] : []),
+    ...(hasFooter ? [`import Footer from "${componentImports}/${footerName}.astro";`] : []),
+    `import "${styleImport}";`,
   ];
   const title = escapeAstroText(ir.metadata.title || "Converted homepage");
   const description = ir.metadata.description
     ? `\n    <meta name="description" content="${attrValue(ir.metadata.description)}" />` : "";
   const bodyClass = attrValue(ir.theme?.bodyClass || "");
-  return `---\n${imports.join("\n")}\n---\n<!doctype html>\n<html lang="${attrValue(ir.metadata.language || "en")}">\n  <head>\n    <meta charset="utf-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1" />\n    <title>${title}</title>${description}\n${stylesheets.map((href) => `    <link rel="stylesheet" href="${attrValue(href)}" />`).join("\n")}${hasThemeCss ? '\n    <link rel="stylesheet" href="/source-theme.css" />' : ""}\n  </head>\n  <body${bodyClass ? ` class="${bodyClass}"` : ""}>\n${hasHeader ? "    <Header />\n" : ""}    <main id="generated-main">\n${sections}\n    </main>\n${hasFooter ? "    <Footer />\n" : ""}${hasMobileNavigation ? '\n    <script>\n      const nav = document.getElementById("mobile-nav");\n      const overlay = document.querySelector<HTMLElement>(".mobile-nav-overlay");\n      const toggle = document.querySelector<HTMLButtonElement>(".mobile-menu-button");\n      const close = nav?.querySelector<HTMLButtonElement>(".mobile-menu-close");\n      function setMenu(open: boolean) {\n        nav?.classList.toggle("is-open", open);\n        overlay?.classList.toggle("is-open", open);\n        toggle?.setAttribute("aria-expanded", String(open));\n      }\n      toggle?.setAttribute("aria-expanded", "false");\n      toggle?.addEventListener("click", () => setMenu(true));\n      close?.addEventListener("click", () => setMenu(false));\n      overlay?.addEventListener("click", () => setMenu(false));\n      document.addEventListener("keydown", (event) => { if (event.key === "Escape") setMenu(false); });\n    </script>\n' : ""}  </body>\n</html>\n`;
+  return `---\n${imports.join("\n")}\n---\n<!doctype html>\n<html lang="${attrValue(ir.metadata.language || "en")}">\n  <head>\n    <meta charset="utf-8" />\n    <meta name="viewport" content="width=device-width, initial-scale=1" />\n    <title>${title}</title>${description}\n${stylesheets.map((href) => `    <link rel="stylesheet" href="${attrValue(href)}" />`).join("\n")}${hasThemeCss ? '\n    <link rel="stylesheet" href="' + themePath + '" />' : ""}\n  </head>\n  <body${bodyClass ? ` class="${bodyClass}"` : ""}>\n${hasHeader ? "    <Header />\n" : ""}    <main id="generated-main">\n${sections}\n    </main>\n${hasFooter ? "    <Footer />\n" : ""}${hasMobileNavigation ? '\n    <script>\n      const nav = document.getElementById("mobile-nav");\n      const overlay = document.querySelector<HTMLElement>(".mobile-nav-overlay");\n      const toggle = document.querySelector<HTMLButtonElement>(".mobile-menu-button");\n      const close = nav?.querySelector<HTMLButtonElement>(".mobile-menu-close");\n      function setMenu(open: boolean) {\n        nav?.classList.toggle("is-open", open);\n        overlay?.classList.toggle("is-open", open);\n        toggle?.setAttribute("aria-expanded", String(open));\n      }\n      toggle?.setAttribute("aria-expanded", "false");\n      toggle?.addEventListener("click", () => setMenu(true));\n      close?.addEventListener("click", () => setMenu(false));\n      overlay?.addEventListener("click", () => setMenu(false));\n      document.addEventListener("keydown", (event) => { if (event.key === "Escape") setMenu(false); });\n    </script>\n' : ""}  </body>\n</html>\n`;
 }
 
 function generatedCss(hasMobileNavigation: boolean): string {
@@ -219,6 +240,9 @@ export async function generateAstro(extractionFolder: string, targetFolder?: str
   const outputDir = path.resolve(targetFolder || path.join("generated", path.basename(extractionDir)));
   if (outputDir === extractionDir || outputDir.startsWith(extractionDir + path.sep)) {
     throw new Error("Generation output must be outside the extraction folder.");
+  }
+  if (await fs.access(path.join(extractionDir, "site-manifest.json")).then(() => true, () => false)) {
+    return generateAstroSite(extractionDir, outputDir);
   }
   const ir = JSON.parse(await fs.readFile(path.join(extractionDir, "page-ir.json"), "utf8")) as PageIR;
   if (ir.schemaVersion !== 1 || !Array.isArray(ir.sections) || !Array.isArray(ir.assets) ||
@@ -281,6 +305,101 @@ export async function generateAstro(extractionFolder: string, targetFolder?: str
     copiedAssets: assetMap.size, stylesheets, warnings: [...new Set(warnings)],
   }, null, 2) + "\n");
   return { outputDir, sections: included.length, files, warnings: [...new Set(warnings)] };
+}
+
+type SiteEntry = { sourceUrl: string; finalUrl: string; folder: string; route: string };
+type SiteInfo = { schemaVersion: number; sourceUrl: string; pages: SiteEntry[]; warnings?: string[] };
+
+function validateIR(ir: PageIR): void {
+  if (ir.schemaVersion !== 1 || !Array.isArray(ir.sections) || !Array.isArray(ir.assets) ||
+      ir.modularization?.policy?.mode !== "strict-hybrid" || ir.modularization.policy.minimumOccurrences !== 3 ||
+      ir.modularization.policy.autoApprove !== false ||
+      ir.modularization.candidates.some(c => c.status !== "pending-review")) {
+    throw new Error("Unsupported IR or modularization policy. Expected strict-hybrid, n=3, autoApprove=false.");
+  }
+}
+
+async function generateAstroSite(extractionDir: string, outputDir: string): Promise<{
+  outputDir: string; sections: number; files: string[]; warnings: string[];
+}> {
+  const manifest = JSON.parse(await fs.readFile(path.join(extractionDir, "site-manifest.json"), "utf8")) as SiteInfo;
+  if (manifest.schemaVersion !== 1 || !Array.isArray(manifest.pages) || !manifest.pages.length) throw new Error("Empty/invalid site manifest");
+  const pages: Array<{ entry: SiteEntry; ir: PageIR; dir: string }> = [];
+  const routeMap = new Map<string, string>();
+  const routeNames = new Set<string>();
+  for (const entry of manifest.pages) {
+    if (!/^pages\/\d{3}$/.test(entry.folder) || !entry.route.startsWith('/') ||
+        !entry.route.endsWith('/') || entry.route.includes('..') || entry.route.includes('\\') || routeNames.has(entry.route)) {
+      throw new Error(`Invalid or duplicate route entry: ${entry.route}`);
+    }
+    const dir = path.join(extractionDir, entry.folder);
+    const ir = JSON.parse(await fs.readFile(path.join(dir, "page-ir.json"), "utf8")) as PageIR;
+    validateIR(ir);
+    pages.push({ entry, ir, dir });
+    routeNames.add(entry.route);
+    routeMap.set(canonicalPageUrl(entry.sourceUrl), entry.route);
+    routeMap.set(canonicalPageUrl(entry.finalUrl), entry.route);
+  }
+  const warnings = [...(manifest.warnings ?? [])];
+  const files: string[] = [];
+  const write = async (relative: string, contents: string): Promise<void> => {
+    const file = path.join(outputDir, relative);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, contents, 'utf8');
+    files.push(relative);
+  };
+  // Only exactly equivalent rendered structure is shared. Different sections retain unique files.
+  const componentCache = new Map<string, string>();
+  const sharedComponent = async (kind: 'Header' | 'Footer', html: string): Promise<string> => {
+    html = html.replace(/ data-ir-id="\d+"/g, "");
+    const fingerprint = createHash('sha256').update(html).digest('hex').slice(0, 12);
+    const name = `${kind}_${fingerprint}`;
+    if (!componentCache.has(name)) {
+      await write(`src/components/${name}.astro`, `<!-- Shared only when full rendered markup is identical -->\n${html}\n`);
+      componentCache.set(name, name);
+    }
+    return name;
+  };
+  let sectionCount = 0;
+  let anyMobileNav = false;
+  const paths: Array<{ route: string; sourceUrl: string }> = [];
+  for (const { entry, ir, dir } of pages) {
+    const assetMap = await copyAssets(ir, dir, outputDir, warnings);
+    const included = ir.sections.filter(s => !shouldSkipSection(s));
+    sectionCount += included.length;
+    const headers = included.filter(s => s.kind === 'header' || s.kind === 'mobile-navigation');
+    const footers = included.filter(s => s.kind === 'footer');
+    const content = included.filter(s => !headers.includes(s) && !footers.includes(s));
+    const render = (s: IRSection, indent: number) => renderNode(s.root, indent, ir.sourceUrl, assetMap, warnings, routeMap);
+    const hasNav = headers.some(s => s.label === 'mobile-nav');
+    anyMobileNav ||= hasNav;
+    const headerName = headers.length ? await sharedComponent('Header', headers.map(s => render(s, 0)).join('\n')) : 'Header';
+    const footerName = footers.length ? await sharedComponent('Footer', footers.map(s => render(s, 0)).join('\n')) : 'Footer';
+    const cssAssets = ir.assets.filter(a => /text\/css/i.test(a.contentType) && assetMap.has(a.url) &&
+      (/cellar_one\/assets\/build\/theme-/.test(a.url) || /gravityforms\/assets\/css\/dist\/basic/.test(a.url) || /swiper.*\.css/.test(a.url)));
+    const stylesheets = cssAssets.map(a => a.publicPath);
+    const themeCss = Boolean(ir.theme?.css?.trim());
+    const hash = createHash('sha256').update(ir.theme?.css || '').digest('hex').slice(0, 12);
+    const themePath = `/source-theme-${hash}.css`;
+    if (themeCss) await write(`public/source-theme-${hash}.css`, ir.theme!.css + '\n');
+    const segments = entry.route.split('/').filter(Boolean);
+    if (segments.some(segment => !/^[a-zA-Z0-9._~%\-]+$/.test(segment) || segment === '.' || segment === '..')) throw new Error('Unsafe generated route');
+    const relative = `src/pages/${segments.length ? segments.join('/') + '/' : ''}index.astro`;
+    const depth = segments.length + 1;
+    const relativeRoot = '../'.repeat(depth);
+    await write(relative, pageTemplate(ir, content.map(s => render(s, 3)).join('\n'), headers.length > 0, footers.length > 0,
+      stylesheets, hasNav, themeCss, `${relativeRoot}components`, `${relativeRoot}styles/generated.css`, headerName, footerName, themePath));
+    paths.push({ route: entry.route, sourceUrl: entry.sourceUrl });
+  }
+  await write('src/styles/generated.css', generatedCss(anyMobileNav) + '\n[data-static-action="true"] { cursor: not-allowed; }\n');
+  await write('astro.config.mjs', 'import { defineConfig } from "astro/config";\nexport default defineConfig({ output: "static" });\n');
+  await write('package.json', JSON.stringify({ name: 'wordpress-to-astro-generated-site', private: true, type: 'module',
+    scripts: { dev: 'astro dev', build: 'astro build', preview: 'astro preview' }, dependencies: { astro: '^7.4.7' } }, null, 2) + '\n');
+  warnings.push('Checkout, purchases and form submissions are intentionally disabled.');
+  warnings.push('Compare each generated page against desktop and mobile screenshots before accepting visual fidelity.');
+  await write('GENERATION_REPORT.json', JSON.stringify({ source: extractionDir, generatedAt: new Date().toISOString(),
+    pages: paths, sharedComponents: [...componentCache.keys()], emittedSections: sectionCount, warnings: [...new Set(warnings)] }, null, 2) + '\n');
+  return { outputDir, sections: sectionCount, files, warnings: [...new Set(warnings)] };
 }
 
 async function main() {

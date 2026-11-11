@@ -128,6 +128,7 @@ function visual(element: RawElement): VisualSnapshot {
 }
 
 function shouldSkip(element: RawElement): boolean {
+  //currently skips a node and all its children
   if (SKIPPED_TAGS.has(element.tag)) return true;
   const className = element.attributes.class ?? "";
   const id = element.attributes.id ?? "";
@@ -135,6 +136,7 @@ function shouldSkip(element: RawElement): boolean {
 }
 
 function classify(element: RawElement): IRSection["kind"] {
+  //prioritizes html tags over css class names
   const c = `${element.attributes.class ?? ""} ${element.attributes.id ?? ""}`.toLowerCase();
   if (element.tag === "header") return "header";
   if (element.tag === "footer") return "footer";
@@ -244,6 +246,9 @@ export function transformCaptures(desktop: Capture, mobile?: Capture, report?: E
   }
 
   const makeNode = (raw: RawElement): IRNode | undefined => {
+    //recursive children creation
+
+
     if (shouldSkip(raw)) return undefined;
     const node: IRNode = {
       id: raw.id,
@@ -336,6 +341,21 @@ export async function transformExtractionFolder(folder: string): Promise<{ ir: P
   return { ir, outputFile };
 }
 
+export async function transformSiteFolder(folder: string): Promise<{ pages: number; files: string[] }> {
+  const directory = path.resolve(folder);
+  const manifest = JSON.parse(await fs.readFile(path.join(directory, "site-manifest.json"), "utf8")) as {
+    schemaVersion: number; pages: Array<{ folder: string }>;
+  };
+  if (manifest.schemaVersion !== 1 || !Array.isArray(manifest.pages)) throw new Error("Invalid site manifest");
+  const files: string[] = [];
+  for (const page of manifest.pages) {
+    if (!/^pages\/\d{3}$/.test(page.folder)) throw new Error("Unsafe page folder in site manifest");
+    const result = await transformExtractionFolder(path.join(directory, page.folder));
+    files.push(result.outputFile);
+  }
+  return { pages: manifest.pages.length, files };
+}
+
 // Allows `node dist/transformer.js <folder>` without changing src/index.ts.
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const folder = process.argv[2];
@@ -343,14 +363,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     console.error("Usage: node dist/transformer.js <extraction-folder>");
     process.exitCode = 1;
   } else {
-    transformExtractionFolder(folder)
-      .then(({ ir, outputFile }) => {
-        console.log(`Wrote: ${outputFile}`);
-        console.log(`Sections: ${ir.sections.map((section) => section.label).join(", ")}`);
-        console.log(`Assets mapped: ${ir.assets.length}`);
-        console.log(`Component candidates (pending approval): ${ir.modularization.candidates.length}`);
-        for (const warning of ir.warnings) console.warn(`WARNING: ${warning}`);
-      })
+    fs.access(path.join(path.resolve(folder), "site-manifest.json"))
+      .then(() => transformSiteFolder(folder).then(({ pages, files }) => console.log(`Transformed ${pages} pages: ${files.length} IR files`)),
+        () => transformExtractionFolder(folder).then(({ ir, outputFile }) => {
+          console.log(`Wrote: ${outputFile}`);
+          console.log(`Sections: ${ir.sections.map((section) => section.label).join(", ")}`);
+          console.log(`Assets mapped: ${ir.assets.length}`);
+          console.log(`Component candidates (pending approval): ${ir.modularization.candidates.length}`);
+          for (const warning of ir.warnings) console.warn(`WARNING: ${warning}`);
+        }))
       .catch((error: unknown) => {
         console.error(error);
         process.exitCode = 1;

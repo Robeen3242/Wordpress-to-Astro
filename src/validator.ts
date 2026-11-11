@@ -9,6 +9,7 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { chromium, type Page } from "playwright";
 
@@ -175,6 +176,9 @@ export async function validateAstro(
   outputFolder = path.join(extractionFolder, "validation"),
 ): Promise<ValidationReport> {
   const sourceDir = path.resolve(extractionFolder);
+  if (await fs.access(path.join(sourceDir, "site-manifest.json")).then(() => true, () => false)) {
+    throw new Error("For a site manifest, use validateSite() or the validator CLI, not validateAstro().");
+  }
   const destination = path.resolve(outputFolder);
   const url = validateUrl(targetUrl);
   await fs.mkdir(destination, { recursive: true });
@@ -265,6 +269,36 @@ export async function validateAstro(
   return report;
 }
 
+export async function validateSite(extractionFolder: string, targetUrl = "http://localhost:4321/"): Promise<{
+  pages: Array<{ route: string; sourceUrl: string; report: ValidationReport }>;
+  warnings: string[];
+}> {
+  const dir = path.resolve(extractionFolder);
+  const manifest = JSON.parse(await fs.readFile(path.join(dir, "site-manifest.json"), "utf8")) as {
+    schemaVersion: number; pages: Array<{ folder: string; route: string; sourceUrl: string }>;
+  };
+  if (manifest.schemaVersion !== 1 || !Array.isArray(manifest.pages)) throw new Error("Invalid site manifest");
+  const output: { pages: Array<{ route: string; sourceUrl: string; report: ValidationReport }>; warnings: string[] } = {
+    pages: [], warnings: [],
+  };
+  for (const page of manifest.pages) {
+    if (!/^pages\/\d{3}$/.test(page.folder) || !page.route.startsWith('/') || page.route.includes('..'))
+      throw new Error('Invalid site page path');
+    const url = new URL(page.route, validateUrl(targetUrl)).toString();
+    try {
+      const report = await validateAstro(path.join(dir, page.folder), url);
+      output.pages.push({ route: page.route, sourceUrl: page.sourceUrl, report });
+    } catch (error) { output.warnings.push(`Could not validate ${page.route}: ${String(error)}`); }
+  }
+  await fs.writeFile(path.join(dir, 'site-validation-report.json'), JSON.stringify(output, null, 2) + '\n');
+  return output;
+}
+
+function awaitableSite(folder: string): boolean {
+  // Synchronous check only for choosing CLI mode; API callers use validateSite explicitly.
+  return existsSync(path.join(path.resolve(folder), 'site-manifest.json'));
+}
+
 function invokedDirectly(): boolean {
   const script = process.argv[1];
   return !!script && import.meta.url === pathToFileURL(path.resolve(script)).href;
@@ -278,7 +312,10 @@ if (invokedDirectly()) {
     );
     process.exitCode = 1;
   } else {
-    validateAstro(extractionFolder, targetUrl, outputFolder)
+    (awaitableSite(extractionFolder) ? validateSite(extractionFolder, targetUrl).then(report => {
+      console.log(`Validated ${report.pages.length} pages; ${report.warnings.length} warnings.`);
+      report.warnings.forEach(w => console.warn(w));
+    }) : validateAstro(extractionFolder, targetUrl, outputFolder)
       .then((report) => {
         console.log(`Validation directory: ${path.resolve(outputFolder ?? path.join(extractionFolder, "validation"))}`);
         for (const item of report.results) {
@@ -290,7 +327,7 @@ if (invokedDirectly()) {
           for (const warning of item.warnings) console.warn(`  Warning: ${warning}`);
         }
         console.log("Saved screenshots, diff images, and validation-report.json");
-      })
+      }))
       .catch((error: unknown) => {
         console.error(error instanceof Error ? error.message : String(error));
         process.exitCode = 1;
